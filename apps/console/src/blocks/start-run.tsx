@@ -1,16 +1,18 @@
-import { useState, useSyncExternalStore } from "react"
+import { useMemo, useState, useSyncExternalStore } from "react"
 import { useLocation } from "wouter"
-import { useManifest, useStalePartitions, useStartRun, useStatuses, type RunInput } from "../api/queries"
+import { useManifest, usePartitionLists, useStalePartitions, useStartRun, useStatuses, type RunInput } from "../api/queries"
 import type { Manifest } from "../api/types"
 import { plural } from "../model/format"
-import { Button, Checkmark, Segmented, TextField } from "../ui/controls"
+import { runnable } from "../model/partitions"
+import { Button, Checkmark, Segmented } from "../ui/controls"
 import { Modal, PickMany, report } from "../ui/overlays"
 import { Notice } from "./atoms"
+import { PartitionPicker } from "./partition-picker"
 
 /* Start a run by hand. One dialog for the whole console, opened from anywhere
  * with what the caller already knows filled in. */
 
-type Preset = { targets?: string[]; mode?: "incremental" | "full"; partitions?: string }
+type Preset = { targets?: string[]; mode?: "incremental" | "full"; /** Partitions to open with selected. */ partitions?: string[] }
 
 let request: Preset | null = null
 const listeners = new Set<() => void>()
@@ -67,20 +69,23 @@ function Form({ preset, close }: { preset: Preset; close: () => void }) {
   const [, navigate] = useLocation()
   const [targets, setTargets] = useState<string[]>(preset.targets ?? [])
   const [which, setWhich] = useState<Which>(preset.partitions ? "list" : "stale")
-  const [named, setNamed] = useState(preset.partitions ?? "")
+  const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set(preset.partitions))
   const [mode, setMode] = useState<RunInput["mode"]>(preset.mode ?? "incremental")
   const [upstream, setUpstream] = useState(false)
   const specs = manifest.data?.assets ?? {}
-  const names = named.split(/[\s]+/).filter(Boolean)
 
   // The partitions choice is about the assets that have partitions; one without has a single state, and always runs.
   const partitioned = targets.filter((name) => specs[name]?.partitions)
+  // Selected picks among the partitions of those assets: what is selected and no longer among them does not run.
+  const listed = usePartitionLists(which === "list" ? partitioned : [])
+  const rows = useMemo(() => listed.lists && runnable(listed.lists), [listed.lists])
+  const names = rows?.filter((row) => selected.has(row.partition)).map((row) => row.partition) ?? []
   const whole = partitioned.length < targets.length ? [""] : []
   const count = (status: "stale" | "total") => partitioned.reduce((sum, name) => sum + (statuses.data?.assets[name]?.partitions[status] ?? 0), 0)
   // Incremental or full is a choice only where an asset reads an input incrementally.
   const incremental = withUpstream(manifest.data, targets, upstream).some((name) => Object.values(specs[name]?.inputs ?? {}).some((input) => input.kind === "incremental"))
   const nothing = which === "stale" && statuses.data !== undefined && count("stale") === 0 && whole.length === 0
-  const ready = targets.length > 0 && (which !== "list" || names.length > 0) && !nothing
+  const ready = targets.length > 0 && (which !== "list" || partitioned.length === 0 || names.length > 0) && !nothing
 
   const submit = async () => {
     const partitions = async () => {
@@ -112,11 +117,18 @@ function Form({ preset, close }: { preset: Preset; close: () => void }) {
         <div className="field">
           <span className="field-label">Partitions</span>
           <Segmented label="Which partitions" value={which} onChange={setWhich} options={[...WHICH]} />
-          {which !== "list" && statuses.data && <span className="field-note num">{plural(count(which === "stale" ? "stale" : "total"), "partition")}</span>}
+          {which !== "list" ? (
+            statuses.data && <span className="field-note num">{plural(count(which === "stale" ? "stale" : "total"), "partition")}</span>
+          ) : listed.error ? (
+            <Notice tone="failed">{(listed.error as Error).message}</Notice>
+          ) : !rows ? (
+            <span className="field-note">Listing partitions…</span>
+          ) : rows.length ? (
+            <PartitionPicker rows={rows} selected={selected} onChange={setSelected} />
+          ) : (
+            <span className="field-note num">{plural(0, "partition")}</span>
+          )}
         </div>
-      )}
-      {partitioned.length > 0 && which === "list" && (
-        <TextField label="Partition names" hideLabel value={named} onChange={setNamed} rows={3} mono placeholder={"alpha\nday=2026-09-01,site=alpha"} />
       )}
       {incremental && (
         <div className="field">

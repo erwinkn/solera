@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "check": "tsc --noEmit && node scripts/check-tokens.mjs",
+    "check": "tsc --noEmit && node scripts/check-tokens.mjs && node scripts/check-themes.mjs",
     "build": "pnpm check && vite build",
     "test": "playwright test"
   },

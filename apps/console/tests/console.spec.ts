@@ -1,9 +1,10 @@
-import { expect, test, type Page } from "@playwright/test"
+import { expect, test, type APIRequestContext, type Page } from "@playwright/test"
 
 /* A small suite over the real thing: the bundle the server serves, against a
  * server running the demo project. It checks that the overview says how the
  * project is doing, that every place opens, that a run can be started and
- * read on its timeline, and that the theme switches and sticks. */
+ * read on its timeline, that partitions can be picked for it, and that the
+ * theme switches, sticks and follows the system. */
 
 const problems: string[] = []
 
@@ -27,6 +28,13 @@ async function setTheme(page: Page, theme: string) {
   await page.getByRole("button", { name: "Change the theme" }).click()
   await page.getByRole("menuitemradio", { name: new RegExp(`^${theme}`) }).click()
   await page.keyboard.press("Escape")
+}
+
+/** site_digest has a partition for each day and each site, and the sites come from a run of `sites`. Its schedule
+ * fires on the minute, so a server that has just started may have none yet: start that run instead of waiting for it. */
+async function sitesLoaded(request: APIRequestContext) {
+  await request.post("/api/projects/demo/runs", { data: { targets: ["sites"], partitions: "latest", mode: "incremental", upstream: false, by: "test" } })
+  await expect.poll(async () => (await (await request.get("/api/projects/demo/partitions/site_digest")).json()).partitions.length, { timeout: 30_000 }).toBeGreaterThan(100)
 }
 
 test("the overview says how every asset is doing and what it did lately", async ({ page }) => {
@@ -119,6 +127,69 @@ test("starting a run offers the choices that apply to the assets picked", async 
   await expect(dialog).toHaveCount(0)
 })
 
+test("partitions are picked from a list that filters, and the run gets their names", async ({ page, request }) => {
+  await sitesLoaded(request)
+  await page.goto("/assets/site_digest")
+  await page.getByRole("button", { name: "Run", exact: true }).click()
+  const dialog = page.getByRole("dialog", { name: "Start a run" })
+  const start = dialog.getByRole("button", { name: "Start", exact: true })
+  await dialog.getByLabel("Which partitions").getByText("Selected", { exact: true }).click()
+
+  // one partition a day for each site since September: hundreds, of which only the rows in view are drawn
+  const list = dialog.getByRole("listbox", { name: "Partitions" })
+  const options = list.getByRole("option")
+  await expect(dialog.getByText(/^0 of \d{3,} selected$/)).toBeVisible()
+  expect(await options.count()).toBeLessThan(30)
+  await expect(options.first()).toHaveAttribute("aria-setsize", /^\d{3,}$/)
+  await expect(start).toBeDisabled()
+
+  // by status: each status that occurs is offered with its count, and narrows the list to its own
+  const statuses = dialog.getByRole("group", { name: "Filter by status" }).getByRole("button")
+  await expect(statuses.first()).toHaveText(/^(Failed|Stale|Never built|Running|Up to date)\d+$/)
+  await statuses.first().click()
+  await expect(statuses.first()).toHaveAttribute("aria-pressed", "true")
+  await statuses.first().click()
+
+  // by name, then everything shown in one click
+  const filter = dialog.getByLabel("Filter partitions")
+  await filter.fill("2026-09-01")
+  await expect(options.first()).toHaveAttribute("aria-setsize", /^\d$/) // that day's partitions: one for each site
+  const shown = await options.count()
+  await dialog.getByRole("button", { name: "Select shown" }).click()
+  await expect(dialog.getByText(new RegExp(`^${shown} of \\d+ selected$`))).toBeVisible()
+  await dialog.getByRole("button", { name: "Clear" }).click()
+  await expect(dialog.getByText(/^0 of \d+ selected$/)).toBeVisible()
+
+  // from the keyboard: type, step into the list, tick with Space; Enter in the filter starts nothing
+  await filter.fill("2026-09-02")
+  await filter.press("Enter")
+  await filter.press("ArrowDown")
+  await expect(options.first()).toBeFocused()
+  await page.keyboard.press("Space")
+  await page.keyboard.press("ArrowDown")
+  await page.keyboard.press("Space")
+  await expect(options.nth(1)).toHaveAttribute("aria-selected", "true")
+  // what a filter hides stays selected
+  await filter.fill("")
+  await expect(dialog.getByText(/^2 of \d+ selected$/)).toBeVisible()
+
+  const [sent] = await Promise.all([page.waitForRequest((r) => r.method() === "POST" && r.url().endsWith("/runs")), start.click()])
+  expect(sent.postDataJSON()).toMatchObject({ targets: ["site_digest"], partitions: ["day=2026-09-02,site=alpha", "day=2026-09-02,site=bravo"] })
+})
+
+test("a partition's own button opens the dialog with it selected", async ({ page, request }) => {
+  await sitesLoaded(request)
+  await page.goto("/assets/site_digest")
+  await page.getByRole("listitem", { name: /^2026-09-03 · bravo:/ }).click()
+  await page.getByRole("button", { name: "Run this partition" }).click()
+  const dialog = page.getByRole("dialog", { name: "Start a run" })
+  await expect(dialog.getByText(/^1 of \d+ selected$/)).toBeVisible()
+  await dialog.getByLabel("Filter partitions").fill("2026-09-03 · bravo")
+  await expect(dialog.getByRole("option")).toHaveCount(1)
+  await expect(dialog.getByRole("option")).toHaveAttribute("aria-selected", "true")
+  await expect(dialog.getByRole("button", { name: "Start", exact: true })).toBeEnabled()
+})
+
 test("the timeline works from the keyboard", async ({ page, request }) => {
   const started = await request.post("/api/projects/demo/runs", { data: { targets: ["sites", "deploy_notice"], partitions: "latest", mode: "incremental", upstream: false, by: "test" } })
   const run = await started.json()
@@ -154,6 +225,45 @@ test("the theme switches at once and is remembered", async ({ page }) => {
   // one typeface for the interface in every theme, served by the console itself
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Inter Variable")
   expect(await page.evaluate(() => document.fonts.check('13px "Inter Variable"'))).toBe(true)
+})
+
+test("System follows the system, live, until a theme is picked", async ({ page }) => {
+  const html = page.locator("html")
+  await page.emulateMedia({ colorScheme: "dark" })
+  await page.goto("/")
+  // a browser that has chosen nothing is on System
+  await expect(html).toHaveAttribute("data-theme", "dark")
+  await page.getByRole("button", { name: "Change the theme" }).click()
+  await expect(page.getByRole("menuitemradio", { name: /^System/ })).toHaveAttribute("aria-checked", "true")
+  await page.keyboard.press("Escape")
+  await page.emulateMedia({ colorScheme: "light" })
+  await expect(html).toHaveAttribute("data-theme", "light")
+
+  // a theme that was picked stays, whatever the system does
+  await setTheme(page, "Dimmed")
+  await page.emulateMedia({ colorScheme: "dark" })
+  await expect(html).toHaveAttribute("data-theme", "dimmed")
+
+  // back on System, in Settings this time, and across a reload during which the system changed
+  await page.goto("/settings")
+  await page.getByRole("radio", { name: /^System/ }).click()
+  await expect(html).toHaveAttribute("data-theme", "dark")
+  await page.emulateMedia({ colorScheme: "light" })
+  await page.reload()
+  await expect(html).toHaveAttribute("data-theme", "light")
+  await expect(page.getByRole("radio", { name: /^System/ })).toHaveAttribute("aria-checked", "true")
+})
+
+test("a browser that stored a theme before System existed keeps it", async ({ page }) => {
+  // what the console wrote until now: the theme's id, and the painted tokens as bare CSS
+  await page.addInitScript(() => {
+    localStorage.setItem("solera.console.look", JSON.stringify({ theme: "dark", custom: [] }))
+    localStorage.setItem("solera.console.paint", "--color-bg: #0b0b0c; color-scheme: dark;")
+  })
+  await page.goto("/")
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark") // the system is light in this browser
+  await page.getByRole("button", { name: "Change the theme" }).click()
+  await expect(page.getByRole("menuitemradio", { name: /^Dark/ })).toHaveAttribute("aria-checked", "true")
 })
 
 test("a custom theme is checked, applied and kept", async ({ page }) => {

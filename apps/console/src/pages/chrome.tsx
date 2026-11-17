@@ -7,7 +7,7 @@ import { shortId } from "../model/format"
 import { firstLine } from "../blocks/assets"
 import { runWhat } from "../blocks/runs"
 import { openStartRun } from "../blocks/start-run"
-import { setLook, themes, useLook } from "../theme/store"
+import { choices, chosen, setLook, useLook } from "../theme/store"
 import { Button } from "../ui/controls"
 import { Palette, type Command_ } from "../ui/overlays"
 
@@ -63,7 +63,7 @@ function PaletteBody() {
     ...Object.keys(manifest.data?.sources ?? {}).map((name): Command_ => ({ value: `source:${name}`, group: "Sources", label: name, keywords: ["source", "commit"], run: () => navigate(`/sources/${encodeURIComponent(name)}`) })),
     ...Object.keys(manifest.data?.sensors ?? {}).map((name): Command_ => ({ value: `sensor:${name}`, group: "Sensors", label: name, keywords: ["sensor"], run: () => navigate(`/sensors/${encodeURIComponent(name)}`) })),
     ...(runs.data?.runs ?? []).map((run): Command_ => ({ value: `run:${run.id}`, group: "Recent runs", label: runWhat(run), note: `${run.status} · ${shortId(run.id)}`, keywords: ["run", run.id], run: () => navigate(`/runs/${run.id}`) })),
-    ...themes(look).filter((t) => t.id !== look.theme).map((t): Command_ => ({ value: `theme:${t.id}`, group: "Look", label: `Theme: ${t.name}`, note: t.note, keywords: ["theme"], run: () => setLook({ theme: t.id }) })),
+    ...choices(look).filter((choice) => choice.id !== chosen(look)).map((choice): Command_ => ({ value: `theme:${choice.id}`, group: "Look", label: `Theme: ${choice.name}`, note: choice.note, keywords: ["theme"], run: () => setLook({ theme: choice.id }) })),
   ]
   return <Palette open onOpenChange={openPalette} commands={commands} />
 }
