@@ -604,8 +604,7 @@ A three-batch run's commit rows say `final` false, false, true; a
 cancelled run logs no `true`.
 
 **STA-12. Freshness is exact whenever asked; there is no `pending` status.**
-Whether a partition is stale is kept exact at every upstream commit and
-every batch commit (one witness due key per input, §6 of the design); the number
+Whether a partition is stale is computed exactly when asked; the number
 of owed keys is counted when asked and cached until the upstream or the
 progress moves. A status asked right after a prefixless pattern change on
 100M keys is exact: never guessed, never `pending`. Where a gate holds an
