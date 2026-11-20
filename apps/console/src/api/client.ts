@@ -3,7 +3,8 @@ import { useSyncExternalStore } from "react"
 /* One fetch wrapper for the whole console. It adds the token, turns an error
  * body into a message, and raises the token prompt when the server says 401.
  * A cookie the project's sign-in reads goes along without asking: these are
- * same-origin requests, and fetch sends cookies on those by default. */
+ * same-origin requests, and fetch sends cookies on those by default. When the
+ * project signs in through a provider, a 401 sends the browser there. */
 
 const TOKEN = "solera.console.token"
 
@@ -56,7 +57,12 @@ export async function request(path: string, init: RequestInit = {}): Promise<Res
   if (init.body) headers.set("Content-Type", "application/json")
   const response = await fetch(path, { ...init, headers })
   if (response.status === 401) {
-    setNeedsToken(true)
+    // A project that signs in through a provider names the page that starts it:
+    // go there, and come back here after. A token the server refused still asks
+    // for another.
+    const signIn = token ? null : await signInPage(response)
+    if (signIn) window.location.assign(`${signIn}?next=${encodeURIComponent(location.pathname + location.search)}`)
+    else setNeedsToken(true)
     throw new ApiError(401, "Authentication required")
   }
   if (!response.ok) {
@@ -71,6 +77,15 @@ export async function request(path: string, init: RequestInit = {}): Promise<Res
     throw new ApiError(response.status, message)
   }
   return response
+}
+
+async function signInPage(response: Response): Promise<string | null> {
+  try {
+    const body = await response.json()
+    return typeof body.sign_in === "string" && body.sign_in.startsWith("/") ? body.sign_in : null
+  } catch {
+    return null
+  }
 }
 
 export async function get<T>(path: string, signal?: AbortSignal): Promise<T> {

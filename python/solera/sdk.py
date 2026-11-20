@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 
+from .access import OpenID
 from .build import identity as build_identity
 from .build import modules as build_modules
 from .errors import describe as describe_errors
@@ -1406,8 +1407,8 @@ class Project:
             raise RegistrationError(str(error)) from None
         self.name = name
         self.retention = retention
-        if sign_in is not None and not callable(sign_in):
-            raise RegistrationError(f"sign_in: {sign_in!r} is not a function")
+        if sign_in is not None and not callable(sign_in) and not isinstance(sign_in, OpenID):
+            raise RegistrationError(f"sign_in: {sign_in!r} is neither a function nor an OpenID")
         self.sign_in = sign_in
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: default_store or _data_store(), **(stores or {})}

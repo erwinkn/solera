@@ -21,11 +21,11 @@ from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from solera import Project, lifecycle
-from solera.access import Identity
+from solera.access import Identity, OpenID
 from solera.lifecycle import Ended
 from solera_worker.worker import described, load_project
 
-from . import auth, reloading
+from . import auth, openid, reloading
 from .engine import Conflict, Engine
 from .executors.local import read_manifest
 from .history import TERMINAL_RUN, RunFilter
@@ -166,6 +166,8 @@ def create_app(
             # restart.
             if signin is None:
                 app.state.signin = loaded.sign_in
+            if isinstance(app.state.signin, OpenID):
+                app.state.signin = openid.Flow(app.state.signin)
         if not token and not app.state.signin and not insecure:
             raise ValueError(
                 "Set SOLERA_API_TOKEN, give the project a sign_in, or explicitly enable insecure local development"
@@ -223,8 +225,11 @@ def create_app(
             return secret is not None and lifecycle.valid(secret, HOST_TOKEN, presented)
         return None
 
-    def unauthenticated() -> JSONResponse:
-        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    def unauthenticated(request: Request) -> JSONResponse:
+        body = {"detail": "Authentication required"}
+        if isinstance(request.app.state.signin, openid.Flow):  # where a browser goes to sign in
+            body["sign_in"] = openid.PATHS["sign_in"]
+        return JSONResponse(body, status_code=401)
 
     async def check(request: Request) -> JSONResponse | None:
         """The one check every /api/ request passes; a refusal, or None to go on.
@@ -239,7 +244,7 @@ def create_app(
         worker = channel(request, presented)
         if worker is not None:
             # Workers are not callers: the sign-in is never asked here, so it cannot open these.
-            return None if worker or admin or insecure else unauthenticated()
+            return None if worker or admin or insecure else unauthenticated(request)
         signed_in = None
         signin = request.app.state.signin
         if not admin and signin is not None:
@@ -260,7 +265,7 @@ def create_app(
                 return JSONResponse({"detail": "The sign-in failed; see the server's log"}, status_code=500)
         identity = ADMIN if admin else signed_in or (LOCAL if insecure else None)
         if identity is None:
-            return unauthenticated()
+            return unauthenticated(request)
         need = auth.needs(request.method)
         if need != "read" and auth.cross_site(request):
             return JSONResponse({"detail": "A change must come from the console's own page"}, status_code=403)
@@ -919,6 +924,25 @@ def create_app(
     # /static/…, and every other path is a client route (/runs/…, and names
     # with dots, like /sensors/landing.observe). A missing bundle file is a
     # 404, never the shell, so a page from an older build fails loudly.
+
+    # -- signing in through a provider (`OpenID`, openid.py) ---------------------------
+
+    def flow(request: Request) -> openid.Flow:
+        if not isinstance(request.app.state.signin, openid.Flow):
+            raise KeyError(request.url.path)  # a 404: this project signs in some other way
+        return request.app.state.signin
+
+    @app.get(openid.PATHS["sign_in"])
+    async def sign_in(request: Request):
+        return await flow(request).sign_in(request)
+
+    @app.get(openid.PATHS["callback"])
+    async def callback(request: Request):
+        return await flow(request).callback(request)
+
+    @app.get(openid.PATHS["sign_out"])
+    async def sign_out(request: Request):
+        return await flow(request).sign_out(request)
 
     @app.get("/")
     async def index():
