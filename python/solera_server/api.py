@@ -1,7 +1,7 @@
 """The solera API (§5, §8-§10): project-scoped reads and run control under
 `/api/projects/{p}`, and the worker channel (docs/lifecycle.md §5): attempt
 routes authenticated by the attempt's own token, pool discovery by a pool
-token. Everything else takes the admin token."""
+token. Everything else takes a caller with a role (`auth.py`, docs/access.md)."""
 
 from __future__ import annotations
 
@@ -20,11 +20,12 @@ import solera_worker
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from solera import lifecycle
+from solera import Project, lifecycle
+from solera.access import Identity
 from solera.lifecycle import Ended
 from solera_worker.worker import described, load_project
 
-from . import reloading
+from . import auth, reloading
 from .engine import Conflict, Engine
 from .executors.local import read_manifest
 from .history import TERMINAL_RUN, RunFilter
@@ -38,6 +39,9 @@ log = logging.getLogger(__name__)
 ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|loaded|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
+
+ADMIN = Identity("admin", "admin")  # whoever holds SOLERA_API_TOKEN
+LOCAL = Identity("local", "admin")  # anyone, under --insecure (loopback only)
 
 
 async def _end_when_stopped(app, runtime) -> None:
@@ -92,14 +96,15 @@ class SourceCommitInput(BaseModel):
     remove: list[str] | None = Field(default=None, max_length=100000)
 
 
-async def _import(project: str, state_url: str, namespace: str) -> tuple[dict, list[str]]:
-    """Import the project into this process, as `solera serve PROJECT` asks,
-    and read its manifest and source files. Code that fails to load is
+async def _import(project: str, state_url: str, namespace: str) -> tuple[Project, dict, list[str]]:
+    """Import the project into this process, as `solera serve PROJECT` asks:
+    it, its manifest and its source files. Code that fails to load is
     recorded first, before this server takes the namespace over: the
     server it was to replace still runs, and shows why (reloading.py)."""
 
     try:
-        return read_manifest(described(load_project(project)))
+        loaded = load_project(project)
+        return loaded, *read_manifest(described(loaded))
     except Exception as error:
         try:
             await reloading.failed(open_store(state_url, namespace)[0], _traceback(error))
@@ -122,12 +127,22 @@ def _traceback(error: BaseException) -> str:
     return "".join(traceback.format_exception(type(error), error, tb or error.__traceback__))
 
 
+def asked_by(request: Request, given: str | None) -> str | None:
+    """Who asked (a run's `by`, a commit's): a caller the project's sign-in
+    named is that name, whatever the body says, so nobody signs with another's.
+    The admin token and --insecure name nobody, so the body's word stands."""
+
+    signed_in = request.state.signed_in
+    return signed_in.name if signed_in is not None else given
+
+
 def create_app(
     *,
     state_url=None,
     namespace=None,
     project=None,
     token=None,
+    signin: auth.SignIn | None = None,
     insecure=False,
     engine=None,
     engine_url=None,
@@ -142,12 +157,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app):
-        if not token and not insecure:
-            raise ValueError("Set SOLERA_API_TOKEN, or explicitly enable insecure local development")
         owned = engine is None
         runtime = engine
         if owned:
-            manifest, files = await _import(project, state_url, namespace)
+            loaded, manifest, files = await _import(project, state_url, namespace)
+            # The project's sign-in (`Project(sign_in=...)`), unless the caller
+            # gave one. A reload keeps the one imported here; a new one takes a
+            # restart.
+            if signin is None:
+                app.state.signin = loaded.sign_in
+        if not token and not app.state.signin and not insecure:
+            raise ValueError(
+                "Set SOLERA_API_TOKEN, give the project a sign_in, or explicitly enable insecure local development"
+            )
+        if owned:
             state = await State.open(state_url, namespace)
             runtime = Engine(
                 state,
@@ -179,30 +202,81 @@ def create_app(
     app = FastAPI(
         title="Data Orchestrator", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
     )
+    app.state.signin = signin
 
     web = Path(__file__).parent / "web"
 
-    def allowed(request: Request) -> bool:
-        presented = request.headers.get("Authorization", "").removeprefix("Bearer ")
-        if hmac.compare_digest(presented.encode(), token.encode()):
-            return True
+    def channel(request: Request, presented: str) -> bool | None:
+        """For a worker channel's route, whether the request carries that
+        channel's own credential; None for any other route."""
+
         path = request.url.path
         if (match := ATTEMPT_ROUTE.match(path)) is not None:
             secret = request.app.state.engine.secret
             return secret is not None and lifecycle.valid(secret, match.group(1), presented)
-        if POOL_ROUTE.match(path) and pool_token:
-            return hmac.compare_digest(presented.encode(), pool_token.encode())
+        if POOL_ROUTE.match(path):  # without a pool token, the admin token alone
+            return bool(pool_token) and hmac.compare_digest(presented.encode(), pool_token.encode())
         if SENSOR_ROUTE.match(path):  # sensor workers: the pool token, or the local host's own
             if pool_token and hmac.compare_digest(presented.encode(), pool_token.encode()):
                 return True
             secret = request.app.state.engine.secret
             return secret is not None and lifecycle.valid(secret, HOST_TOKEN, presented)
-        return False
+        return None
+
+    def unauthenticated() -> JSONResponse:
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+
+    async def check(request: Request) -> JSONResponse | None:
+        """The one check every /api/ request passes; a refusal, or None to go on.
+        A worker channel's route takes its own credential (or the admin token).
+        Every other route takes a caller with the role its method needs
+        (`auth.needs`), recognised in order by the admin token, the project's
+        sign-in, and --insecure; it is left on `request.state` for the routes,
+        as `identity`, and as `signed_in` too when the sign-in named it."""
+
+        presented = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        admin = bool(token) and hmac.compare_digest(presented.encode(), token.encode())
+        worker = channel(request, presented)
+        if worker is not None:
+            # Workers are not callers: the sign-in is never asked here, so it cannot open these.
+            return None if worker or admin or insecure else unauthenticated()
+        signed_in = None
+        signin = request.app.state.signin
+        if not admin and signin is not None:
+            try:
+                signed_in = await auth.sign_in(signin, request)
+            except Exception as error:
+                # Fail closed. A 500, not a 401: the caller may well be who they say,
+                # and a 401 would send a browser round its sign-in again for nothing.
+                # The log gets the error's type and where it was raised, never its
+                # message: a parser's message quotes its input, here a cookie or a token.
+                log.error(
+                    "the project's sign-in failed on %s %s: %s\n%s",
+                    request.method,
+                    request.url.path,
+                    type(error).__name__,
+                    "".join(traceback.format_tb(error.__traceback__)),
+                )
+                return JSONResponse({"detail": "The sign-in failed; see the server's log"}, status_code=500)
+        identity = ADMIN if admin else signed_in or (LOCAL if insecure else None)
+        if identity is None:
+            return unauthenticated()
+        need = auth.needs(request.method)
+        if need != "read" and auth.cross_site(request):
+            return JSONResponse({"detail": "A change must come from the console's own page"}, status_code=403)
+        if not auth.allows(identity, need):
+            return JSONResponse(
+                {"detail": f"This needs the {need} role; {identity.name} has {identity.role}."},
+                status_code=403,
+            )
+        request.state.identity = identity
+        request.state.signed_in = signed_in
+        return None
 
     @app.middleware("http")
     async def authenticate(request: Request, call_next):
-        if request.url.path.startswith("/api/") and token and not allowed(request):
-            return JSONResponse({"detail": "Authentication required"}, status_code=401)
+        if request.url.path.startswith("/api/") and (refused := await check(request)) is not None:
+            return refused
         state = request.app.state.engine.state
         recorded = state.recorded
         response = await call_next(request)
@@ -273,6 +347,11 @@ def create_app(
         if runtime.state.poisoned:
             return JSONResponse({"status": "unavailable", "backend": "object-store"}, status_code=503)
         return {"status": "degraded" if runtime.failing else "ok", "backend": "object-store"}
+
+    @app.get("/api/me")
+    async def me(request: Request):
+        identity = request.state.identity
+        return {"name": identity.name, "role": identity.role}
 
     @app.get("/api/diagnostics")
     async def diagnostics(request: Request):
@@ -476,7 +555,7 @@ def create_app(
     ):
         runtime = await project_engine(request, p)
         fields = body.model_dump()
-        fields["by"] = fields["by"] or "api"
+        fields["by"] = asked_by(request, fields["by"]) or "api"
         run = await runtime.submit(**fields, command_id=idempotency_key)
         return run or {"status": "skipped-active"}
 
@@ -622,22 +701,22 @@ def create_app(
     @app.post("/api/projects/{p}/runs/{run_id}/cancel")
     async def cancel_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.cancel(run_id)
+        return await runtime.cancel(run_id, by=asked_by(request, None))
 
     @app.post("/api/projects/{p}/runs/{run_id}/retry")
     async def retry_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.retry(run_id)
+        return await runtime.retry(run_id, by=asked_by(request, None))
 
     @app.post("/api/projects/{p}/runs/{run_id}/pause")
     async def pause_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.pause(run_id)
+        return await runtime.pause(run_id, by=asked_by(request, None))
 
     @app.post("/api/projects/{p}/runs/{run_id}/resume")
     async def resume_run(p: str, run_id: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.pause(run_id, False)
+        return await runtime.pause(run_id, False, by=asked_by(request, None))
 
     # -- attempts ----------------------------------------------------------------
 
@@ -694,12 +773,14 @@ def create_app(
         partitions, runs}`, the runs it started."""
 
         runtime = await asset_engine(request, p, name)
-        return await runtime.retry_keys(name, body.classes, body.partition, body.by or "api")
+        return await runtime.retry_keys(
+            name, body.classes, body.partition, asked_by(request, body.by) or "api"
+        )
 
     @app.post("/api/projects/{p}/cleanups:clear")
     async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
         runtime = await project_engine(request, p)
-        return runtime.clear_cleanups(body.output, body.partition, body.by or "api")
+        return runtime.clear_cleanups(body.output, body.partition, asked_by(request, body.by) or "api")
 
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
 
@@ -790,7 +871,7 @@ def create_app(
     @app.post("/api/projects/{p}/automations/{name}/run-now", status_code=202)
     async def automation_run_now(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)
-        return runtime.automation_view(await runtime.run_automation(name))
+        return runtime.automation_view(await runtime.run_automation(name, by=asked_by(request, None)))
 
     # -- sources -------------------------------------------------------------------
 
@@ -803,7 +884,7 @@ def create_app(
             keys=body.keys,
             upsert=body.upsert,
             remove=body.remove,
-            by=body.by or "api",
+            by=asked_by(request, body.by) or "api",
         )
 
     # -- executors + workers --------------------------------------------------------
@@ -867,6 +948,7 @@ def local_transport(engine: Engine, token: str):
     from solera_worker.channel import LocalTransport
 
     if engine.local_app is None:  # held by the engine, so the two go together
+        # Its lifespan never runs, so it loads no sign-in: this app serves workers alone.
         engine.local_app = create_app(engine=engine, token=secrets.token_hex(16))
         engine.local_app.state.engine = engine
     return LocalTransport(engine.local_app, token)

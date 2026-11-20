@@ -1,6 +1,6 @@
 import { Play } from "lucide-react"
 import { Link } from "wouter"
-import { useAutomationCommand, useAutomations, useSensors, useTicks } from "../api/queries"
+import { useAutomationCommand, useAutomations, useCanWrite, useSensors, useTicks } from "../api/queries"
 import { duration, until } from "../model/format"
 import { triggerText } from "../model/status"
 import { IconButton } from "../ui/controls"
@@ -13,6 +13,7 @@ import { AutomationToggle } from "./assets"
 export function AutomationsTable({ dense }: { dense?: boolean }) {
   const automations = useAutomations()
   const command = useAutomationCommand()
+  const canWrite = useCanWrite()
   const now = Date.now() / 1000
   if (automations.error) return <Failure error={automations.error} />
   if (!automations.data) return <Loading what="Loading automations" />
@@ -23,19 +24,19 @@ export function AutomationsTable({ dense }: { dense?: boolean }) {
       <table className="table">
         <thead>
           <tr>
-            <th className="fit">On</th>
+            {canWrite && <th className="fit">On</th>}
             <th>Asset</th>
             <th>Trigger</th>
             {!dense && <th>Name</th>}
             {!dense && <th>Last started</th>}
             <th className="end">Next start</th>
-            <th className="end fit" />
+            {canWrite && <th className="end fit" />}
           </tr>
         </thead>
         <tbody>
           {rows.map((automation) => (
             <tr key={automation.name} data-off={automation.enabled ? undefined : ""}>
-              <td className="fit"><AutomationToggle automation={automation} /></td>
+              {canWrite && <td className="fit"><AutomationToggle automation={automation} /></td>}
               <td>
                 <span className="row wrap">{automation.targets.map((t) => <AssetLink key={t} name={t} />)}</span>
               </td>
@@ -52,11 +53,13 @@ export function AutomationsTable({ dense }: { dense?: boolean }) {
                 </td>
               )}
               <td className="end num">{!automation.enabled ? <span className="faint">off</span> : automation.next_at ? until(automation.next_at, now) : <span className="faint">{automation.trigger.kind === "ondeploy" ? "on deploy" : "on change"}</span>}</td>
-              <td className="end fit">
-                <IconButton label={`Run ${automation.name} now`} size="s" onClick={() => report(command.mutateAsync({ name: automation.name, command: "run-now" }), `${automation.name} started a run`)}>
-                  <Play size={13} />
-                </IconButton>
-              </td>
+              {canWrite && (
+                <td className="end fit">
+                  <IconButton label={`Run ${automation.name} now`} size="s" onClick={() => report(command.mutateAsync({ name: automation.name, command: "run-now" }), `${automation.name} started a run`)}>
+                    <Play size={13} />
+                  </IconButton>
+                </td>
+              )}
             </tr>
           ))}
         </tbody>

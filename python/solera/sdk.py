@@ -1384,6 +1384,7 @@ class Project:
         errors: Mapping[type, type] | None = None,
         build: str | None = None,
         name: str = "default",
+        sign_in: Callable | None = None,
     ):
         """`default_store` holds every output that names no store: unless
         given, the store `$SOLERA_DATA_URL` names — a FileStore at a
@@ -1393,7 +1394,8 @@ class Project:
         subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`).
         `build` names the code explicitly (else `$SOLERA_BUILD`, else the
         source of the project's modules: `solera.build`); it is part of the
-        deploy."""
+        deploy. `sign_in` recognises the server's callers: called with each
+        request, it returns an `Identity` or None (docs/access.md)."""
 
         from .errors import check_mapping
         from .stores import FileStore
@@ -1404,6 +1406,9 @@ class Project:
             raise RegistrationError(str(error)) from None
         self.name = name
         self.retention = retention
+        if sign_in is not None and not callable(sign_in):
+            raise RegistrationError(f"sign_in: {sign_in!r} is not a function")
+        self.sign_in = sign_in
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: default_store or _data_store(), **(stores or {})}
         home, self._module = _caller()

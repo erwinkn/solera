@@ -3,12 +3,13 @@ import { Check, Copy, Palette as PaletteIcon, Trash2, Upload } from "lucide-reac
 import { useEffect, useRef, useState } from "react"
 import { useLocation } from "wouter"
 import { forgetToken, hasToken } from "../api/client"
+import { useMe } from "../api/queries"
 import { BUILT_IN, starterTheme } from "../theme/themes"
 import { choices, chosen, currentTheme, paint, resolve, setLook, useLook } from "../theme/store"
 import { parseCustomTheme, TOKENS, TOKEN_NAMES, type CustomTheme, type Problem, type Theme } from "../theme/tokens"
 import { Button, Disclosure, TextField } from "../ui/controls"
 import { confirm, toast } from "../ui/overlays"
-import { Notice, Panel } from "./atoms"
+import { Facts, Notice, Panel } from "./atoms"
 
 /* How the console looks: which theme. It is remembered in the browser and
  * changes at once, without a reload. */
@@ -232,20 +233,25 @@ function ThemeEditor({ existing, close }: { existing?: CustomTheme; close: () =>
 }
 
 function SessionPanel() {
-  if (!hasToken()) return null
+  const me = useMe()
   return (
-    <Panel title="This session">
-      <div className="row wrap">
-        <span className="grow muted">The API token is kept in this tab until you close it.</span>
-        <Button
-          onClick={() => {
-            forgetToken()
-            window.location.reload()
-          }}
-        >
-          Forget the token
-        </Button>
-      </div>
+    <Panel
+      title="This session"
+      actions={
+        hasToken() && (
+          <Button
+            size="s"
+            onClick={() => {
+              forgetToken()
+              window.location.reload()
+            }}
+          >
+            Forget the token
+          </Button>
+        )
+      }
+    >
+      <Facts rows={[["Name", me.data?.name], ["Role", me.data?.role]]} />
     </Panel>
   )
 }

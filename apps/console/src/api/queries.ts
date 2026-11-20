@@ -58,6 +58,13 @@ export function useHealth() {
   })
 }
 
+/** Who the console acts for, and what they may do. Asked once: the gate waits for it, so every page knows. */
+export type Me = { name: string; role: "read" | "write" | "admin" }
+export const useMe = () => useQuery({ queryKey: ["me"], queryFn: ({ signal }) => get<Me>("/api/me", signal), staleTime: Infinity })
+
+/** Whether the caller may change anything. One who may only read sees no control that would: they are hidden, not disabled. */
+export const useCanWrite = () => useMe().data?.role !== "read"
+
 export function useDiagnostics() {
   return useQuery({ queryKey: ["diagnostics"], queryFn: ({ signal }) => get<Diagnostics>("/api/diagnostics", signal), refetchInterval: SLOW })
 }

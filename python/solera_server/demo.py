@@ -434,37 +434,45 @@ def deploy_notice(ctx):
     ctx.log("project deployed", run=ctx.run_id)
 
 
-project = Project(
-    assets=[
-        sites,
-        site_feed,
-        file_index,
-        file_checks,
-        site_digest,
-        fleet_index,
-        site_status,
-        *([fleet_status] if DATABASE else []),
-        manual_ingest,
-        weekly_digest,
-        deploy_notice,
-    ],
-    sources=[
-        Source("roadmap"),  # lineage-only: read via resources, pinned via deps=
-        uploads,  # external DynamicPartitions, fed by the commit API and `upload_drop`
-    ],
-    sensors=[upload_drop],
-    stores={
-        "postgres": PostgresStore(dsn="env:DATABASE_URL"),
-    },
-    default_store=default_store(),
-    resources={
-        "registry": SiteRegistry(),
-        "feed": FeedClient(),
-        "uploads_reader": UploadReader(),
-        "mailer": Mailer(),
-    },
-    automations=[
-        Cron("*/5 * * * *", name="refresh-index", targets=[site_feed, file_index]),
-    ],
-    name="demo",
-)
+def build(sign_in=None) -> Project:
+    """The demo project. The console's tests also serve it with a sign-in
+    that lets everyone only read (apps/console/tests/signin.py)."""
+
+    return Project(
+        assets=[
+            sites,
+            site_feed,
+            file_index,
+            file_checks,
+            site_digest,
+            fleet_index,
+            site_status,
+            *([fleet_status] if DATABASE else []),
+            manual_ingest,
+            weekly_digest,
+            deploy_notice,
+        ],
+        sources=[
+            Source("roadmap"),  # lineage-only: read via resources, pinned via deps=
+            uploads,  # external DynamicPartitions, fed by the commit API and `upload_drop`
+        ],
+        sensors=[upload_drop],
+        stores={
+            "postgres": PostgresStore(dsn="env:DATABASE_URL"),
+        },
+        default_store=default_store(),
+        resources={
+            "registry": SiteRegistry(),
+            "feed": FeedClient(),
+            "uploads_reader": UploadReader(),
+            "mailer": Mailer(),
+        },
+        automations=[
+            Cron("*/5 * * * *", name="refresh-index", targets=[site_feed, file_index]),
+        ],
+        name="demo",
+        sign_in=sign_in,
+    )
+
+
+project = build()

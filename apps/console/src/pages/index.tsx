@@ -1,7 +1,7 @@
 import { Menu as MenuIcon, X } from "lucide-react"
 import { useState, type ReactNode } from "react"
 import { Link, useLocation } from "wouter"
-import { useDiagnostics, useHealth, useManifest, useRun, useStatuses } from "../api/queries"
+import { useCanWrite, useDiagnostics, useHealth, useManifest, useRun, useStatuses } from "../api/queries"
 import type { RunDetail } from "../api/types"
 import { PartitionActivity, StripLegend, WindowPicker } from "../blocks/activity"
 import { AssetActions, AssetsTable, AssetState, CommitsTable, Definition, firstLine, KeysPanel, PartitionGrid, SourcesTable } from "../blocks/assets"
@@ -274,20 +274,24 @@ function Asset({ name }: { name: string }) {
 }
 
 function Source({ name }: { name: string }) {
+  const about = (
+    <>
+      <Panel title="About">
+        <SourceFacts name={name} />
+      </Panel>
+      <Panel title="Keys">
+        <SourceKeys name={name} />
+      </Panel>
+      <Panel title="Recent commits">
+        <SourceCommits name={name} />
+      </Panel>
+    </>
+  )
+  if (!useCanWrite()) return <Page title={name}>{about}</Page>
   return (
     <Page title={name}>
       <div className="wb-split">
-        <div>
-          <Panel title="About">
-            <SourceFacts name={name} />
-          </Panel>
-          <Panel title="Keys">
-            <SourceKeys name={name} />
-          </Panel>
-          <Panel title="Recent commits">
-            <SourceCommits name={name} />
-          </Panel>
-        </div>
+        <div>{about}</div>
         <aside className="wb-aside" aria-label="Commit a change">
           <Panel title="Commit a change">
             <SourceCommitForm name={name} />
@@ -326,6 +330,7 @@ function Sensor({ name }: { name: string }) {
 
 function Engine() {
   const failed = Boolean(useDiagnostics().data?.load_error)
+  const canWrite = useCanWrite()
   return (
     <Page>
       {failed && (
@@ -342,9 +347,11 @@ function Engine() {
       <Panel title="Cleanups" flush>
         <CleanupsPanel />
       </Panel>
-      <Panel title="Old runs">
-        <PruneRuns />
-      </Panel>
+      {canWrite && (
+        <Panel title="Old runs">
+          <PruneRuns />
+        </Panel>
+      )}
     </Page>
   )
 }

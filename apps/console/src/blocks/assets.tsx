@@ -1,7 +1,7 @@
 import { Play, RotateCcw, Search } from "lucide-react"
 import { useState } from "react"
 import { Link, useLocation } from "wouter"
-import { useAsset, useAutomationCommand, useCommits, useManifest, useOutcomes, usePartitions, useRetryKeys, useStaleKeys, useStatuses } from "../api/queries"
+import { useAsset, useAutomationCommand, useCanWrite, useCommits, useManifest, useOutcomes, usePartitions, useRetryKeys, useStaleKeys, useStatuses } from "../api/queries"
 import type { AssetSpec, AssetStatus, Automation, Manifest, PartitionRow, Reason } from "../api/types"
 import { count, duration, partitionLabel, plural, until } from "../model/format"
 import { projectGraph } from "../model/graph"
@@ -162,6 +162,7 @@ export function PartitionMeter({ status }: { status: AssetStatus }) {
 export function AssetActions({ name, size = "m" }: { name: string; size?: "s" | "m" }) {
   const statuses = useStatuses()
   const retry = useRetryKeys()
+  const canWrite = useCanWrite()
   const failing = statuses.data?.assets[name]?.stored_counts ?? null
   const classes = FAILING_KEYS.filter((c) => failing?.[c])
   const [, navigate] = useLocation()
@@ -169,6 +170,7 @@ export function AssetActions({ name, size = "m" }: { name: string; size?: "s" | 
     const result = await report(retry.mutateAsync({ asset: name, classes: which }), (r) => (r.runs.length ? `${plural(r.runs.length, "run")} started for the failing keys` : "Nothing to retry right now"))
     if (result?.runs[0]) navigate(`/runs/${result.runs[0].id}`)
   }
+  if (!canWrite) return null
   return (
     <div className="row wrap">
       {classes.length > 0 && (
@@ -228,6 +230,7 @@ export function AssetState({ name, bare }: { name: string; bare?: boolean }) {
 export function PartitionGrid({ name }: { name: string }) {
   const partitions = usePartitions(name, true)
   const [open, setOpen] = useState<PartitionRow | null>(null)
+  const canWrite = useCanWrite()
   if (partitions.error) return <Notice tone="idle">{(partitions.error as Error).message}</Notice>
   if (!partitions.data) return <Loading what="Listing partitions" />
   const rows = partitions.data.partitions
@@ -256,9 +259,11 @@ export function PartitionGrid({ name }: { name: string }) {
             <span className="mono">{partitionLabel(open.partition)}</span>
             <StatusPill status={partitionStatus(open.status)} />
             <span className="grow" />
-            <Button size="s" icon={<Play size={13} />} onClick={() => openStartRun({ targets: [name], partitions: [open.partition] })}>
-              Run this partition
-            </Button>
+            {canWrite && (
+              <Button size="s" icon={<Play size={13} />} onClick={() => openStartRun({ targets: [name], partitions: [open.partition] })}>
+                Run this partition
+              </Button>
+            )}
           </div>
           {open.reasons?.length ? <p className="muted">{open.reasons.map(reasonText).join(". ")}.</p> : null}
           {open.last_attempt && (
@@ -388,6 +393,8 @@ export function CommitsTable({ name }: { name: string }) {
 
 export function AutomationToggle({ automation }: { automation: Automation }) {
   const command = useAutomationCommand()
+  const canWrite = useCanWrite()
+  if (!canWrite) return null
   return (
     <Toggle
       label={`${automation.name} is ${automation.enabled ? "on" : "off"}`}

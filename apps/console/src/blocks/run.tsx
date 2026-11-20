@@ -1,7 +1,7 @@
 import { Ban, Pause, Play, RotateCcw, Trash2 } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import { Link, useLocation } from "wouter"
-import { useAttemptLogs, useAttemptResult, useDeleteRun, useRunCommand, useRunEvents } from "../api/queries"
+import { useAttemptLogs, useAttemptResult, useCanWrite, useDeleteRun, useRunCommand, useRunEvents } from "../api/queries"
 import { PHASES, type Attempt, type RunDetail, type RunRequest, type Task } from "../api/types"
 import { bytes, clock, duration, list, partitionLabel, plural, shortId, when } from "../model/format"
 import { attemptStatus, heldReason, isLive, keyStatus, origin, taskStatus, TERMINAL_TASK } from "../model/status"
@@ -40,10 +40,11 @@ export function runSentence(run: RunRequest, view: RunView | null): string {
 export function RunActions({ run, size = "m" }: { run: RunRequest; size?: "s" | "m" }) {
   const command = useRunCommand()
   const remove = useDeleteRun()
+  const canWrite = useCanWrite()
   const [, navigate] = useLocation()
   const live = isLive(run)
   const act = (name: "cancel" | "retry" | "pause" | "resume", done: string) => report(command.mutateAsync({ id: run.id, command: name }), done)
-  if (run.source) return null
+  if (run.source || !canWrite) return null
   return (
     <div className="row wrap">
       {live && (run.paused ? (

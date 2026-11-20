@@ -1,7 +1,7 @@
 import { ChevronRight, Eraser, Trash2 } from "lucide-react"
 import { useState, type ReactNode } from "react"
 import { Link } from "wouter"
-import { useAutomations, useClearCleanups, useCleanups, useDiagnostics, useExecutors, useHealth, useManifest, usePruneRuns, useSensors, useStatuses, useWorkers, type Health } from "../api/queries"
+import { useAutomations, useCanWrite, useClearCleanups, useCleanups, useDiagnostics, useExecutors, useHealth, useManifest, usePruneRuns, useSensors, useStatuses, useWorkers, type Health } from "../api/queries"
 import { partitionLabel, plural, when } from "../model/format"
 import { assetStatus, triggerText, type Status, type Tone } from "../model/status"
 import { Button } from "../ui/controls"
@@ -205,6 +205,7 @@ export function ExecutorsTable() {
 export function CleanupsPanel() {
   const cleanups = useCleanups()
   const clear = useClearCleanups()
+  const canWrite = useCanWrite()
   const now = Date.now() / 1000
   if (!cleanups.data) return <Loading />
   const rows = cleanups.data.cleanups
@@ -231,7 +232,7 @@ export function CleanupsPanel() {
                   {stuck ? <span className="tone" data-tone="failed">{plural(stuck, "cleanup")} gave up</span> : row.due ? `Old data goes ${when(row.due, now)}` : `${row.pending ?? 0} waiting`}
                 </td>
                 <td className="end">
-                  {stuck > 0 && (
+                  {stuck > 0 && canWrite && (
                     <Button
                       size="s"
                       icon={<Eraser size={13} />}
