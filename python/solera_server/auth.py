@@ -37,19 +37,27 @@ def cross_site(request: Request) -> bool:
     site = request.headers.get("Sec-Fetch-Site")
     if site is not None:
         return site not in ("same-origin", "none")
-    origin = request.headers.get("Origin")
-    if origin is None:
+    sent = request.headers.get("Origin")
+    if sent is None:
         return False
     # The whole origin, scheme included: the http page of the same host is
-    # another site. Behind a proxy the server sees the proxy's scheme and
-    # perhaps its host, so what the proxy forwarded speaks first. A page
-    # cannot forge those: a cross-site request with a header of its own
-    # choosing is asked about first (CORS), and this server never agrees.
+    # another site. A page cannot forge the forwarded headers `origin` reads:
+    # a cross-site request with a header of its own choosing is asked about
+    # first (CORS), and this server never agrees.
+    theirs = urlsplit(sent)
+    scheme, host = origin(request)
+    return (theirs.scheme.lower(), theirs.netloc.lower()) != (scheme.lower(), host.lower())
+
+
+def origin(request: Request) -> tuple[str, str]:
+    """The scheme and host the browser used. Behind a proxy the server sees
+    the proxy's scheme and perhaps its host, so what the proxy forwarded
+    speaks first."""
+
     headers = request.headers
     scheme = headers.get("X-Forwarded-Proto", request.url.scheme).split(",")[0].strip()
     host = headers.get("X-Forwarded-Host", headers.get("Host", "")).split(",")[0].strip()
-    theirs = urlsplit(origin)
-    return (theirs.scheme.lower(), theirs.netloc.lower()) != (scheme.lower(), host.lower())
+    return scheme, host
 
 
 def allows(identity: Identity, role: str) -> bool:

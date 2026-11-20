@@ -11,7 +11,8 @@ The server tries these in order and stops at the first that knows the caller.
 1. **The admin token.** A request with `Authorization: Bearer $SOLERA_API_TOKEN`
    is `admin`, named `admin`. It is the way in before anything else is set up.
 2. **The project's sign-in.** `Project(sign_in=function)` gives a function
-   that is called with each request the token did not match. It returns an
+   that is called with each request the token did not match (or
+   `sign_in=OpenID(...)`, below, a sign-in through a provider). It returns an
    `Identity`, or `None` when it does not know the caller. It may be `async`;
    a plain one runs in a thread.
 3. **`--insecure`.** On a loopback-only server, anyone else is `admin`, named
@@ -98,3 +99,56 @@ fetched raise, so the request is refused rather than let through.
 
 A sign-in that reads a cookie needs nothing more: the console's requests are
 same-origin, and browsers send cookies with those.
+
+## Signing in through a provider
+
+`OpenID` signs people in through any OpenID Connect provider: Google,
+Microsoft Entra, Okta, Auth0, or an app of your own that is one.
+
+```python
+import os
+
+from solera import Identity, OpenID, Project
+
+
+def identity(claims):
+    """The caller, from the provider's ID token; None refuses them."""
+
+    if not claims.get("email", "").endswith("@acme.com"):
+        return None
+    role = "admin" if "admins" in claims.get("groups", []) else "write"
+    return Identity(claims["email"], role)
+
+
+project = Project(
+    ...,
+    sign_in=OpenID(
+        issuer="https://login.acme.com",
+        client_id="solera",
+        client_secret=os.environ["SOLERA_CLIENT_SECRET"],
+        identity=identity,
+    ),
+)
+```
+
+Register the server with the provider as a client whose return address is
+`https://<the server>/auth/callback`. Then:
+
+1. The console's first request gets a 401 that names `/auth/sign-in`, and the
+   browser goes there. The server sends it to the provider's sign-in page,
+   with a fresh `state`, `nonce` and PKCE challenge, kept in a signed cookie
+   for ten minutes.
+2. The provider signs the person in and sends the browser back to
+   `/auth/callback` with a code. The server checks the `state` is the one
+   this browser was given, trades the code for an ID token (with the client
+   secret and the PKCE verifier), and checks the token's signature against
+   the provider's published keys, its issuer, audience, expiry and nonce.
+3. `identity(claims)` makes the caller. The server keeps it in a session
+   cookie of its own, signed and `HttpOnly`, for `hours` (8 by default),
+   and sends the browser back to the page it started from.
+
+After that each request is a cookie check; the provider is not asked again
+until the session ends, so a role changed at the provider applies at the next
+sign-in. `/auth/sign-out` ends the session. The cookies are signed with a key
+derived from the engine's secret, which the state keeps, so a restart signs
+nobody out.

@@ -4,7 +4,8 @@ makes one from a request."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 ROLES = ("read", "write", "admin")
 
@@ -21,3 +22,20 @@ class Identity:
             raise ValueError(f"an identity needs a name, not {self.name!r}")
         if self.role not in ROLES:
             raise ValueError(f"{self.name}: role {self.role!r} is not one of {', '.join(ROLES)}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class OpenID:
+    """A sign-in through an OpenID Connect provider (docs/access.md): the
+    server sends a browser that has no session to `issuer` to sign in, and
+    keeps a session of its own for `hours` afterwards. `identity` makes the
+    caller from the provider's ID token claims (`email`, `name`, and any the
+    provider adds), or refuses them with None. The provider must accept
+    `{server}/auth/callback` as this client's return address."""
+
+    issuer: str
+    client_id: str
+    client_secret: str = field(repr=False)
+    identity: Callable[[dict], Identity | None]
+    scopes: tuple[str, ...] = ("openid", "email", "profile")
+    hours: float = 8
