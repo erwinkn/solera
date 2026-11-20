@@ -1,3 +1,4 @@
+from .access import Identity
 from .errors import Abort, Failed, Rejected, Transient
 from .executors import AWSECS, K8sJob, Local, Modal, Placement, Pool
 from .patterns import Regex
@@ -70,6 +71,7 @@ __all__ = [
     "Every",
     "Failed",
     "FileStore",
+    "Identity",
     "In",
     "Incremental",
     "K8sJob",

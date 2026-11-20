@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query"
 import { useState, type FormEvent } from "react"
 import { hasToken, saveToken, useNeedsToken } from "./api/client"
-import { ProjectContext, useDiagnostics } from "./api/queries"
+import { ProjectContext, useDiagnostics, useMe } from "./api/queries"
 import { Routes } from "./Routes"
 import { Button, TextField } from "./ui/controls"
 import { Overlays } from "./ui/overlays"
@@ -25,12 +25,13 @@ export function App() {
   )
 }
 
-/** Nothing renders until the console knows which project the server runs, and has a token if the server wants one. */
+/** Nothing renders until the console knows which project the server runs and who it acts for, and has a token if the server wants one. */
 function Gate() {
   const needsToken = useNeedsToken()
   const diagnostics = useDiagnostics()
+  const me = useMe()
   if (needsToken) return <TokenPrompt />
-  if (diagnostics.data)
+  if (diagnostics.data && me.data)
     return (
       <ProjectContext.Provider value={diagnostics.data.project}>
         <Routes />
@@ -40,11 +41,11 @@ function Gate() {
     <main className="gate">
       <div className="gate-card">
         <h1 className="gate-title">Solera</h1>
-        {diagnostics.isError ? (
+        {diagnostics.isError || me.isError ? (
           <>
             <p>The console cannot reach the server.</p>
-            <p className="muted">{(diagnostics.error as Error).message}</p>
-            <Button onClick={() => diagnostics.refetch()}>Try again</Button>
+            <p className="muted">{((diagnostics.error ?? me.error) as Error).message}</p>
+            <Button onClick={() => (diagnostics.isError ? diagnostics.refetch() : me.refetch())}>Try again</Button>
           </>
         ) : (
           <p className="muted">Connecting…</p>

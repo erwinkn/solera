@@ -58,7 +58,9 @@ outputs imports neither.
 State lands in `./.solera` — a `file://` object store using the same client
 interfaces as S3. Asset data lands in `.solera/data` next to the project
 file (`SOLERA_DATA_URL` overrides it: `file:///path`, or `s3://bucket/prefix` for an S3Store). `--insecure` disables token auth and is restricted to
-loopback; set `SOLERA_API_TOKEN` for anything else.
+loopback; set `SOLERA_API_TOKEN` for anything else. To let people sign in
+with their own accounts and roles (read, write, admin), see
+[docs/access.md](docs/access.md).
 
 A local serve reloads (`--insecure`, or `--reload` elsewhere; `--no-reload`
 turns it off): when the code the project runs changes, the engine serves

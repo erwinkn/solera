@@ -24,7 +24,7 @@ from solera_server.state import State
 from tests.server.remote import own
 
 
-def build_project():
+def build_project(**options):
     feed_keys = {"rows": [{"k": "a", "v": 1}, {"k": "b", "v": 2}]}
 
     @asset(outputs=Output("feed", key="k"))
@@ -60,6 +60,7 @@ def build_project():
         assets=[feed, total, daily, by_site, flaky, trained],
         sources=[upload, sites],
         name="example",
+        **options,
     )
 
 

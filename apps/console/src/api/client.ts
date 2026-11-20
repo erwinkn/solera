@@ -1,7 +1,9 @@
 import { useSyncExternalStore } from "react"
 
 /* One fetch wrapper for the whole console. It adds the token, turns an error
- * body into a message, and raises the token prompt when the server says 401. */
+ * body into a message, and raises the token prompt when the server says 401.
+ * A cookie the project's sign-in reads goes along without asking: these are
+ * same-origin requests, and fetch sends cookies on those by default. */
 
 const TOKEN = "solera.console.token"
 
@@ -22,7 +24,7 @@ function setNeedsToken(value: boolean) {
   for (const listener of listeners) listener()
 }
 
-/** True while the server wants a token the console does not have (or has wrong). */
+/** True while the server wants a caller it recognises: no token, a wrong one, or a sign-in that lapsed. */
 export function useNeedsToken(): boolean {
   return useSyncExternalStore(
     (listener) => {

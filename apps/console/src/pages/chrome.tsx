@@ -2,7 +2,7 @@ import { useShortcut } from "@ui-sdk/react/shortcuts"
 import { Activity, Boxes, Cog, KeyRound, LayoutDashboard, Play, Search, Server, Zap } from "lucide-react"
 import { useSyncExternalStore } from "react"
 import { useLocation } from "wouter"
-import { useManifest, useRuns } from "../api/queries"
+import { useCanWrite, useManifest, useRuns } from "../api/queries"
 import { shortId } from "../model/format"
 import { firstLine } from "../blocks/assets"
 import { runWhat } from "../blocks/runs"
@@ -56,8 +56,9 @@ function PaletteBody() {
   const manifest = useManifest()
   const runs = useRuns({}, 12, false)
   const look = useLook()
+  const canWrite = useCanWrite()
   const commands: Command_[] = [
-    { value: "do:run", group: "Do", label: "Start a run", icon: <Play size={15} />, run: () => openStartRun() },
+    ...(canWrite ? [{ value: "do:run", group: "Do", label: "Start a run", icon: <Play size={15} />, run: () => openStartRun() }] : []),
     ...PLACES.map((place): Command_ => ({ value: `go:${place.href}`, group: "Go to", label: place.label, icon: <place.icon size={15} />, run: () => navigate(place.href) })),
     ...Object.entries(manifest.data?.assets ?? {}).map(([name, spec]): Command_ => ({ value: `asset:${name}`, group: "Assets", label: name, note: firstLine(spec.doc).slice(0, 60), keywords: ["asset"], run: () => navigate(`/assets/${encodeURIComponent(name)}`) })),
     ...Object.keys(manifest.data?.sources ?? {}).map((name): Command_ => ({ value: `source:${name}`, group: "Sources", label: name, keywords: ["source", "commit"], run: () => navigate(`/sources/${encodeURIComponent(name)}`) })),
@@ -79,6 +80,7 @@ export function SearchButton() {
 }
 
 export function StartRunButton() {
+  if (!useCanWrite()) return null
   return (
     <Button variant="primary" icon={<Play size={13} />} onClick={() => openStartRun()}>
       Start a run

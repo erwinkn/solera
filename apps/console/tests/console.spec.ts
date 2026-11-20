@@ -281,3 +281,36 @@ test("a custom theme is checked, applied and kept", async ({ page }) => {
   await expect(page.locator("html")).toHaveCSS("background-color", "rgb(1, 2, 3)")
   await expect(page.getByRole("radio", { name: /^Probe/ })).toHaveAttribute("aria-checked", "true")
 })
+
+test("one who may only read sees nothing that would change anything", async ({ page, request }) => {
+  test.skip(Boolean(process.env.SOLERA_CONSOLE_URL), "needs the reading server playwright.config.ts starts")
+  const reader = "http://127.0.0.1:8798"
+  // the job that runs on each deploy has run: a finished run to look at
+  const runs = async () => (await (await request.get(`${reader}/api/projects/demo/runs?status=succeeded&asset=deploy_notice`)).json()).runs as { id: string }[]
+  await expect.poll(async () => (await runs()).length, { timeout: 30_000 }).toBeGreaterThan(0)
+  const refused = await request.post(`${reader}/api/projects/demo/runs`, { data: { targets: ["sites"] } })
+  expect(refused.status()).toBe(403)
+  expect((await refused.json()).detail).toBe("This needs the write role; reader@example.com has read.")
+
+  await page.goto(`${reader}/settings`)
+  await expect(page.getByText("reader@example.com")).toBeVisible()
+  const writes = /^(Start a run|Run|Run again|Run this partition|Retry what failed|Retry failing keys|Cancel|Pause|Resume|Delete|Delete old runs|Commit the change|Clear)$/
+  for (const [path, heading] of [
+    ["/", "Overview"],
+    ["/assets/sites", "sites"],
+    [`/runs/${(await runs())[0]!.id}`, null],
+    ["/automations", "Automations"],
+    ["/sources/uploads", "uploads"],
+    ["/engine", "Engine"],
+  ] as const) {
+    await page.goto(reader + path)
+    if (heading) await expect(page.getByRole("heading", { level: 1 })).toHaveText(heading)
+    else await expect(page.getByText("Started by")).toBeVisible()
+    await expect(page.getByRole("button", { name: writes })).toHaveCount(0)
+    await expect(page.getByRole("switch")).toHaveCount(0)
+    await expect(page.getByRole("button", { name: /^Run \S+ now$/ })).toHaveCount(0)
+  }
+  // nor in the command palette
+  await page.keyboard.press("ControlOrMeta+k")
+  await expect(page.getByRole("option", { name: "Start a run" })).toHaveCount(0)
+})

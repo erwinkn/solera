@@ -1698,7 +1698,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 self._fire(auto, auto.get("partitions") or "latest")
 
-    def _automation_run(self, auto, partitions, targets=None) -> dict | None:
+    def _automation_run(self, auto, partitions, targets=None, by=None) -> dict | None:
         """The run a firing becomes, in the run's own vocabulary (§9); `None`
         if every partition is in flight or waits for its inputs."""
 
@@ -1710,6 +1710,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             auto.get("config"),
             auto.get("keys"),
             automation=auto["name"],
+            by=by,
             skip_active=True,
             skip_missing_inputs=auto.get("skip_missing_inputs"),
             tags=auto.get("tags"),
@@ -1727,10 +1728,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         }
         self.state.record(*submitted, {**fired, **fields})
 
-    def _fire(self, auto, partitions):
+    def _fire(self, auto, partitions, by=None):
+        """`by`: who fired it by hand; a firing of its own trigger names nobody."""
+
         run = None
         try:
-            run = self._automation_run(auto, partitions)
+            run = self._automation_run(auto, partitions, by=by)
         except Exception as error:
             self.failing[f"automation {auto['name']}"] = str(error)
         else:
@@ -1806,11 +1809,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.state.record({"type": "AutomationChanged", "name": name, "enabled": bool(enabled)})
         return self.m.automations[name]
 
-    async def run_automation(self, name: str):
+    async def run_automation(self, name: str, by: str | None = None):
         auto = self.m.automations.get(name)
         if auto is None:
             raise KeyError(name)
-        self._fire(auto, auto.get("partitions") or "latest")
+        self._fire(auto, auto.get("partitions") or "latest", by)
         return self.m.automations[name]
 
     # -- run control ------------------------------------------------------------------
