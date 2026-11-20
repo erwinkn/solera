@@ -304,6 +304,8 @@ export type Diagnostics = {
   active_runs: number
   postgres: boolean
   last_error: string | null
+  /** The latest code that did not load, on a reload or a new server's start: this server runs the code before it. */
+  load_error: { at: number; error: string } | null
   incomplete_full_runs: { output: string; partition: string; asset: string }[]
   anomalies: Record<string, unknown>[]
   skipped_history_rows: unknown[]

@@ -40,6 +40,8 @@ export function useAttention(): { concerns: Concern[]; ready: boolean } {
   const out: Concern[] = []
   const state = healthStatus(health.data)
   if (state.tone === "failed") out.push({ id: "health", tone: "failed", text: `${state.label}.`, href: "/engine" })
+  const loadError = diagnostics.data?.load_error
+  if (loadError) out.push({ id: "load", tone: "failed", text: `Code saved or deployed at ${when(loadError.at, Date.now() / 1000)} did not load, so the server still runs the code before it.`, href: "/engine" })
   if (diagnostics.data?.last_error) out.push({ id: "error", tone: "stale", text: `The engine reports a problem in the background: ${diagnostics.data.last_error}`, href: "/engine" })
   for (const [name, status] of Object.entries(statuses.data?.assets ?? {})) {
     const s = assetStatus(status)
@@ -126,6 +128,18 @@ export function EngineFacts() {
         ["Odd batches held back", d.anomalies.length ? String(d.anomalies.length) : null],
       ]}
     />
+  )
+}
+
+/** Why the latest code did not load: its traceback, as the server or reload saw it. */
+export function LoadError() {
+  const error = useDiagnostics().data?.load_error
+  if (!error) return null
+  return (
+    <>
+      <p>The code saved or deployed at {when(error.at, Date.now() / 1000)} did not load. The server still runs the code before it, until code that loads replaces it.</p>
+      <pre className="code logs" tabIndex={0}>{error.error}</pre>
+    </>
   )
 }
 

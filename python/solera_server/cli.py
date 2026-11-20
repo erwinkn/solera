@@ -142,7 +142,13 @@ def _main():
     common.add_argument("--project", default=os.getenv("SOLERA_PROJECT"))
     commands = parser.add_subparsers(dest="command", required=True)
 
-    serve = commands.add_parser("serve", help="Serve the API and console", parents=[common])
+    serve = commands.add_parser("serve", help="Serve the API and console")
+    serve.add_argument(
+        "project",
+        nargs="?",
+        default=os.getenv("SOLERA_PROJECT", "solera_server.demo:project"),
+        help="file.py, file.py:attr or module:attr (default: $SOLERA_PROJECT, else the demo)",
+    )
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     serve.add_argument("--insecure", action="store_true", help="Loopback-only: disable token auth")
@@ -269,7 +275,6 @@ def _main():
 
         from .api import create_app
 
-        project = args.project or "solera_server.demo:project"
         # uvicorn shuts down gracefully on SIGTERM, then raises it again into the
         # handler it found: the default one would end a finished stop as killed
         # (143), and systemd would mark the unit failed. A stop is a success.
@@ -277,7 +282,7 @@ def _main():
         app = create_app(
             state_url=args.state_url,
             namespace=args.namespace,
-            project=project,
+            project=args.project,
             insecure=args.insecure,
             reload=args.insecure if args.reload is None else args.reload,
             # Where workers reach this engine: set SOLERA_ENGINE_URL to a

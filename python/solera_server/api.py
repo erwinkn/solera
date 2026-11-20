@@ -12,22 +12,25 @@ import os
 import re
 import secrets
 import signal
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import solera_worker
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from solera import lifecycle
 from solera.lifecycle import Ended
+from solera_worker.worker import described, load_project
 
 from . import reloading
 from .engine import Conflict, Engine
-from .executors.local import load_manifest
+from .executors.local import read_manifest
 from .history import TERMINAL_RUN, RunFilter
 from .journal import Fenced
 from .sensors import HOST_TOKEN
-from .state import LostOwnership, State, Unavailable
+from .state import LostOwnership, State, Unavailable, open_store
 from .tracking import full as core_full
 
 log = logging.getLogger(__name__)
@@ -89,6 +92,36 @@ class SourceCommitInput(BaseModel):
     remove: list[str] | None = Field(default=None, max_length=100000)
 
 
+async def _import(project: str, state_url: str, namespace: str) -> tuple[dict, list[str]]:
+    """Import the project into this process, as `solera serve PROJECT` asks,
+    and read its manifest and source files. Code that fails to load is
+    recorded first, before this server takes the namespace over: the
+    server it was to replace still runs, and shows why (reloading.py)."""
+
+    try:
+        return read_manifest(described(load_project(project)))
+    except Exception as error:
+        try:
+            await reloading.failed(open_store(state_url, namespace)[0], _traceback(error))
+        except Exception:
+            log.exception("the project did not load, and that could not be recorded")
+        raise
+
+
+LOADER = (str(Path(__file__).parent), str(Path(solera_worker.__file__).parent))
+
+
+def _traceback(error: BaseException) -> str:
+    """`error`'s traceback from the project's own code on: the frames of
+    the import that reached it (this package's, the worker's, importlib's)
+    say nothing about what to fix."""
+
+    tb = error.__traceback__
+    while tb is not None and tb.tb_frame.f_code.co_filename.startswith((*LOADER, "<frozen")):
+        tb = tb.tb_next
+    return "".join(traceback.format_exception(type(error), error, tb or error.__traceback__))
+
+
 def create_app(
     *,
     state_url=None,
@@ -114,7 +147,7 @@ def create_app(
         owned = engine is None
         runtime = engine
         if owned:
-            manifest, files = await load_manifest(project, watch=True)
+            manifest, files = await _import(project, state_url, namespace)
             state = await State.open(state_url, namespace)
             runtime = Engine(
                 state,
@@ -128,6 +161,7 @@ def create_app(
             except BaseException:
                 await state.close()
                 raise
+            await reloading.loaded(state.objects)
         app.state.engine = runtime
         await runtime.start()
         if owned and reload:  # a local serve: each new deploy served as its code changes
@@ -232,7 +266,7 @@ def create_app(
     @app.get("/healthz")
     async def health(request: Request):
         # A liveness probe: 503 only when a restart is the fix, the journal stopped or the state
-        # broken. Something failing in the background (a merge, an automation, a reload) is
+        # broken. Something failing in the background (a merge, an automation) is
         # degraded: a restart would fix none of it, and its error is in /api/diagnostics only,
         # since this route is unauthenticated.
         runtime = engine_of(request)
@@ -255,6 +289,8 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
+            # the latest code that did not load, a reload's or a new server's: this one serves the code before it
+            "load_error": await reloading.load_error(runtime.state.objects),
             # a run left midway: its readers wait until a run of its producer completes it
             "incomplete_full_runs": core_full.stopped(runtime),
             # a batch loaded, from a table, a version or an absence nothing explains: it held the
