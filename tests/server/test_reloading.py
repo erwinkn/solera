@@ -3,7 +3,9 @@ the project's code changes; a burst of saves one deploy; an edit that fails
 to load the current deploy kept, the error shown, until a fix."""
 
 import asyncio
+from types import SimpleNamespace
 
+from obstore.store import MemoryStore
 from solera_server import reloading
 from solera_server.executors.local import load_manifest
 
@@ -26,7 +28,11 @@ class Served:
     """An engine as the reload sees it: what it serves, and what fails."""
 
     def __init__(self, manifest):
-        self.manifest, self.failing, self.deploys = manifest, {}, []
+        self.manifest, self.deploys = manifest, []
+        self.state = SimpleNamespace(objects=MemoryStore())
+
+    async def load_error(self):
+        return await reloading.load_error(self.state.objects)
 
     def redeploy(self, manifest) -> bool:
         if manifest["deploy"] == self.manifest["deploy"]:
@@ -63,11 +69,14 @@ async def test_a_code_change_is_served_and_a_broken_one_is_not(tmp_path, monkeyp
         await asyncio.sleep(0.5)
         assert len(served.deploys) == 1
         (tmp_path / "helpers.py").write_text("def f(: return\n")  # half saved
-        await until(lambda: "reload" in served.failing)
-        assert "still serving the previous deploy" in served.failing["reload"] and len(served.deploys) == 1
+        for _ in range(1200):
+            if error := await served.load_error():
+                break
+            await asyncio.sleep(0.05)
+        assert "SyntaxError" in error["error"] and len(served.deploys) == 1
         (tmp_path / "helpers.py").write_text("def f(): return 5\n")
         await until(lambda: len(served.deploys) == 2)
-        assert "reload" not in served.failing
+        assert await served.load_error() is None
     finally:
         task.cancel()
 

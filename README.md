@@ -307,7 +307,7 @@ through the server instead.
 ## CLI
 
 ```text
-solera serve [--project SPEC] [--insecure]   API + console (default project: the demo)
+solera serve [PROJECT] [--insecure]         API + console (default project: the demo)
 solera manifest --project SPEC               print the project manifest
 solera run TARGET... [--partitions latest|all|missing] [--partition KEY]
            [--upstream] [--full] [--keys INPUT=k1,k2|INPUT=all] [--config JSON] [--tag NAME=VALUE]
@@ -324,8 +324,12 @@ solera cleanups OUTPUT [PARTITION] [--clear]   pending and stuck cleanups
 solera selftest                              storage conformance probe
 ```
 
-`--project` accepts `module:attribute`, a `file.py` path, or `file.py:attr`;
-it also reads `SOLERA_PROJECT`. With `SOLERA_SERVER_URL` set every command talks
+A project is named as `module:attribute`, a `file.py` path, or
+`file.py:attr` (`solera serve`'s argument, every other command's
+`--project`); it also reads `SOLERA_PROJECT`. `solera serve` imports it
+into its own process, as `python my_project.py` would: code that does not
+load stops that server before it takes the namespace over, and the server
+still running shows why in its console. With `SOLERA_SERVER_URL` set every command talks
 to the server (token from `SOLERA_API_TOKEN`); without it they drive a local
 engine against `SOLERA_STATE_URL`/`--state-url` (`--namespace` selects the
 namespace). `solera worker pool` additionally needs `SOLERA_PROJECT` so claimed
@@ -356,8 +360,8 @@ def daily_digests(ctx, site_files): ...
 project = Project(assets=[site_files, daily_digests], sources=[sites], name="mine")
 ```
 
-Save as `my_project.py` and `uv run solera serve --insecure --project
-my_project.py` (the attribute defaults to `project`). Cursors, resources,
+Save as `my_project.py` and `uv run solera serve my_project.py --insecure`
+(the attribute defaults to `project`). Cursors, resources,
 whole, incremental and per-key inputs, placements, triggers, and the Postgres stores
 are documented in [docs/architecture.md](docs/architecture.md);
 `python/solera_server/demo.py` exercises all of them.

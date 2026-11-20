@@ -236,8 +236,14 @@ async def load_manifest(project: str, *, timeout: float = 60, watch: bool = Fals
         if process.returncode:
             tail = (stdout + stderr).decode(errors="replace")[-8192:]
             raise RuntimeError(f"Project manifest failed ({process.returncode}):\n{tail}")
-        if out.stat().st_size > 4 * 1024 * 1024:
-            raise ValueError("Manifest exceeds the 4 MiB limit")
-        manifest = json.loads(out.read_text())
-        files = manifest.pop("watch", [])
+        manifest, files = read_manifest(out.read_text())
         return (manifest, files) if watch else manifest
+
+
+def read_manifest(text: str) -> tuple[dict, list[str]]:
+    """A project's manifest and the files it watches, from `described`'s JSON."""
+
+    if len(text.encode()) > 4 * 1024 * 1024:
+        raise ValueError("Manifest exceeds the 4 MiB limit")
+    manifest = json.loads(text)
+    return manifest, manifest.pop("watch", [])

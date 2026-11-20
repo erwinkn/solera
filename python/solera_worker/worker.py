@@ -114,6 +114,15 @@ def load_project(entrypoint: str) -> Project:
     return project
 
 
+def described(project: Project) -> str:
+    """What the server learns of a project: its manifest, and the source
+    files of the code it runs (`watch`, what a local serve's reload polls),
+    as JSON text — the same whether the server imported the project itself
+    or a `manifest` process did."""
+
+    return json.dumps({**project.manifest, "watch": project.files()}, allow_nan=False)
+
+
 def _objects(url: str):
     import obstore
 
@@ -1391,8 +1400,7 @@ async def main():
     if mode == "manifest":
         # solera_worker manifest PROJECT OUT: the manifest, and the files of the code it runs
         entrypoint, out = rest[0], rest[1]
-        project = load_project(entrypoint)
-        Path(out).write_text(json.dumps({**project.manifest, "watch": project.files()}, allow_nan=False))
+        Path(out).write_text(described(load_project(entrypoint)))
         return
     if mode == "run":
         # solera_worker run --objects URL --attempt ID --run RUN (SOLERA_PROJECT env entrypoint)

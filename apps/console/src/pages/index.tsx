@@ -8,7 +8,7 @@ import { AssetActions, AssetsTable, AssetState, CommitsTable, Definition, firstL
 import { Empty, Failure, Loading, Panel, StatusPill, useParam } from "../blocks/atoms"
 import { AutomationsTable, SensorFacts, SensorsTable, TicksTable } from "../blocks/automations"
 import { RunTimeline, TroubleFilter, useRunView } from "../blocks/charts"
-import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, PruneRuns, useAttention } from "../blocks/engine"
+import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, LoadError, PruneRuns, useAttention } from "../blocks/engine"
 import { AssetActivity, Summary } from "../blocks/home"
 import { KeyLookup } from "../blocks/keys"
 import { LookMenu, LookSettings } from "../blocks/look"
@@ -325,8 +325,14 @@ function Sensor({ name }: { name: string }) {
 }
 
 function Engine() {
+  const failed = Boolean(useDiagnostics().data?.load_error)
   return (
     <Page>
+      {failed && (
+        <Panel title="Code that did not load">
+          <LoadError />
+        </Panel>
+      )}
       <Panel title="State">
         <EngineFacts />
       </Panel>
